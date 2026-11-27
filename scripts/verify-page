@@ -4,32 +4,48 @@
 Usage:
   scripts/verify-page REFERENCE TARGET [options]
   scripts/verify-page REFERENCE --serve DIR [options]   # serves DIR with python3 -m http.server and tests it
+  scripts/verify-page REFERENCE --self-test             # each check must catch an injected fault
 
 REFERENCE is the owner's file. TARGET is an http(s) URL or a local file. --serve DIR starts
 `python3 -m http.server` on DIR (next to the browser) and tests http://127.0.0.1:PORT/.
 
-1. Bytes: the target (curl --compressed, redirects followed) has the reference's sha256, and its
-   Content-Type is --expect-content-type (default "text/html; charset=utf-8", what GitHub Pages sends).
-2. Frames: the reference (file://) and the target are each loaded in Chrome's deterministic mode
-   (chrome-headless-shell, --deterministic-mode, BeginFrameControl): virtual time
-   (Emulation.setVirtualTimePolicy) advances in 16.7 ms ticks, and every frame is produced by
-   HeadlessExperimental.beginFrame at frameTimeTicks = virtual time, so requestAnimationFrame,
-   CSS animations/transitions and IntersectionObserver all run on the same clock on both sides.
-   For each viewport (desktop 1440x900, mobile 390x844 with touch, device scale 1), scheme
-   (light, dark) and position (the top, then scrolled to each top-level <section>), frames are
-   captured at --times ms after the first frame following load (or the scroll), and compared pixel
-   for pixel. The reference is rendered twice in independent browsers first, to show it is
-   deterministic against itself; the table shows both comparisons.
-   Dark: prefers-color-scheme is emulated as dark AND the page's own theme toggle (#site-theme) is
-   clicked once in that browser profile, so the theme comes from the page's localStorage on the
-   next loads, as for a returning visitor; light: a fresh profile with prefers-color-scheme light.
+Every page load is a fresh tab in Chrome's deterministic mode (chrome-headless-shell,
+--deterministic-mode, BeginFrameControl). Virtual time (Emulation.setVirtualTimePolicy) advances in
+16.7 ms ticks and every frame is produced by HeadlessExperimental.beginFrame at frame time = virtual
+time, so requestAnimationFrame, CSS animations/transitions and IntersectionObserver run on the same
+clock on every side. 16.7 ms keeps every timestamp on Chrome's 100 us timer grid; with 1000/60 ms its
+jittered timer coarsening (a random per-process secret) made the reference differ from itself.
+Scrollbars are hidden in the capture (Emulation.setScrollbarsHidden); the HTTP cache and service
+workers are bypassed.
+
+The matrix: viewports desktop 1440x900 and mobile 390x844 (touch, device scale 1) x light and dark x
+positions (the top, each top-level <section> scrolled to, and the top with a real mouse click on the
+theme toggle at --click-at ms) x --times (ms after the first frame following load or scroll).
+Dark: prefers-color-scheme is emulated as dark and the page's own toggle (#site-theme) is clicked once
+in that fresh browser profile, so later loads take the theme from the page's localStorage, as for a
+returning visitor. The reference is rendered twice, in independent browsers (the reference control),
+then the target once. The verdict is PASS only if every check passes:
+
+  bytes          every load's main-frame response, as Chrome received it: final URL, HTTP status 200,
+                 Content-Type (--expect-content-type, http(s) only), sha256 of the body (Fetch
+                 interception for http(s); the decoded document text for file:) equal to the reference
+  sections       each side's top-level sections are --expect-sections
+  scroll         each position is reached: scrollY is the section's top (or the bottom clamp), the
+                 section intersects the viewport, right after the scroll and after the last frame
+  captures       every capture decodes, has the viewport's size and is not one uniform colour
+  motion         where a moving landmark (the orbital canvas) is at least half on screen, its pixels
+                 change between every two consecutive captured times, on every side
+  theme          data-theme is the scheme on every load; the click flips it and stores it
+  control        reference vs reference: every frame identical
+  frames         reference vs target: every frame identical
 
 BeginFrameControl exists only in chrome-headless-shell on Linux, so on other systems (or without
 --chrome) the script runs itself inside Docker: python:3.12-slim (pinned digest) with
 chrome-headless-shell 158.0.8127.88 from Chrome for Testing (pinned sha256), built on first use.
 Exit status 0 = PASS, 1 = FAIL, 2 = could not run.
 """
-import argparse, base64, hashlib, json, os, select, shutil, signal, socket, subprocess, sys, tempfile, time, zlib
+import argparse, base64, hashlib, http.server, json, multiprocessing, os, pathlib, select, shutil, signal, socket, \
+    subprocess, sys, tempfile, threading, time, zlib
 
 CHS_VERSION = "158.0.8127.88"
 CHS_SHA256 = {
@@ -52,9 +68,27 @@ RUN set -e; case "$(uname -m)" in x86_64) p=linux64; s={CHS_SHA256['linux64']};;
 """
 
 VIEWPORTS = {"desktop": (1440, 900, False), "mobile": (390, 844, True)}
-SCHEMES = ("light", "dark")
 TICK = 16.7  # ms: ~60 Hz, and on Chrome's 100 us timer grid, so its jittered timer coarsening has nothing to round
 INITIAL_VIRTUAL_TIME = 1767225600  # fixed Date.now() origin (2026-01-01T00:00:00Z) on every side
+DEFAULT_TIMES = "0,250,500,1000,2000,4000,8000,14000"  # 14 s: past the Getting started 12.5 s auto-advance
+# The launch page v8's top-level sections, in order.
+EXPECTED_SECTIONS = ("section 1 .hero,section 2 .stats,#introduction,#performance,#verification,#scalability,"
+                     "#dataset,#architecture,#getting-started,section 10 .closing")
+# Moving landmarks of the launch page: (rule, the share of the element that must be on screen for the rule).
+# "every": changes between every two consecutive captured times: the orbital canvas rotates and shimmers with
+#   every requestAnimationFrame; the engineering diagrams loop CSS animations and rAF memory tokens; the
+#   Getting started explorer (whole, as its typing is at the top and its tab progress above) types, grows
+#   its tab progress bar, and advances to the next tab at 12.5 s.
+# "first": an entrance animation started by IntersectionObserver: changes between the first two captured times.
+LANDMARKS = {"#orb-canvas": ("every", 0.5), "#engineering-motion": ("every", 0.5), "#start-explorer": ("every", 0.9),
+             "#speed-chart": ("first", 0.5), "#memory-chart": ("first", 0.5), ".precision-visual": ("first", 0.5),
+             "#scalability-graph": ("first", 0.5)}
+CLICK = "top + theme click"
+INJECT = os.environ.get("VERIFY_PAGE_INJECT", "")  # --self-test only: the fault to inject
+
+
+class CouldNotRun(Exception):
+    pass
 
 
 def die(msg):
@@ -116,20 +150,30 @@ class Chrome:
             finally:
                 os._exit(127)
         os.close(to_r); os.close(from_w)
-        self.w, self.r, self.buf, self.next_id, self.events = to_w, from_r, b"", 0, []
+        self.w, self.r, self.buf, self.next_id = to_w, from_r, b"", 0
+        self.events, self.replies, self.pages = [], {}, {}
 
     def _read(self, timeout):
         while b"\0" not in self.buf:
             if not select.select([self.r], [], [], timeout)[0]:
-                raise TimeoutError("no message from Chrome in %ss" % timeout)
+                raise CouldNotRun("no message from Chrome in %ss" % timeout)
             d = os.read(self.r, 1 << 22)
             if not d:
-                raise EOFError("Chrome closed the pipe (see %s)" % self.log.name)
+                raise CouldNotRun("Chrome closed the pipe")
             self.buf += d
         m, self.buf = self.buf.split(b"\0", 1)
         return json.loads(m)
 
-    def send(self, method, params=None, session=None, timeout=120):
+    def _pump(self, timeout):
+        m = self._read(timeout)
+        if "id" in m:
+            self.replies[m["id"]] = m
+        elif m.get("method") == "Fetch.requestPaused" and m.get("sessionId") in self.pages:
+            self.pages[m["sessionId"]].on_paused(m["params"])
+        else:
+            self.events.append(m)
+
+    def post(self, method, params=None, session=None):
         self.next_id += 1
         msg = {"id": self.next_id, "method": method, "params": params or {}}
         if session:
@@ -137,23 +181,30 @@ class Chrome:
         data = json.dumps(msg).encode() + b"\0"
         while data:
             data = data[os.write(self.w, data):]
-        while True:
-            m = self._read(timeout)
-            if m.get("id") == self.next_id:
-                if "error" in m:
-                    raise RuntimeError(f"{method}: {m['error']}")
-                return m["result"]
-            if "method" in m:
-                self.events.append(m)
+        return self.next_id
+
+    def result(self, mid, method="", timeout=120):
+        while mid not in self.replies:
+            self._pump(timeout)
+        m = self.replies.pop(mid)
+        if "error" in m:
+            raise CouldNotRun(f"{method}: {m['error']}")
+        return m["result"]
+
+    def send(self, method, params=None, session=None, timeout=120):
+        return self.result(self.post(method, params, session), method, timeout)
+
+    def take(self, method, session):
+        out = [e for e in self.events if e["method"] == method and e.get("sessionId") == session]
+        self.events = [e for e in self.events if not (e["method"] == method and e.get("sessionId") == session)]
+        return out
 
     def wait(self, method, session=None, timeout=120):
         while True:
             for i, e in enumerate(self.events):
                 if e["method"] == method and (session is None or e.get("sessionId") == session):
                     return self.events.pop(i)
-            m = self._read(timeout)
-            if "method" in m:
-                self.events.append(m)
+            self._pump(timeout)
 
     def close(self):
         try:
@@ -172,22 +223,29 @@ class Chrome:
 class Page:
     """One tab under virtual time; every frame is produced by beginFrame at the virtual clock."""
 
-    def __init__(self, chrome, viewport, scheme):
-        self.c = chrome
+    def __init__(self, chrome, viewport, scheme, url):
+        self.c, self.viewport = chrome, viewport
         w, h, mobile = VIEWPORTS[viewport]
         self.target = chrome.send("Target.createTarget", {"url": "about:blank", "width": w, "height": h,
                                                           "enableBeginFrameControl": True})["targetId"]
         self.s = chrome.send("Target.attachToTarget", {"targetId": self.target, "flatten": True})["sessionId"]
+        chrome.pages[self.s] = self
+        self.paused = []
         self.cmd("Page.enable")
+        self.cmd("Network.enable")
+        self.cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+        self.cmd("Network.setBypassServiceWorker", {"bypass": True})
+        if is_url(url):
+            self.cmd("Fetch.enable", {"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Response"}]})
         self.cmd("Emulation.setDeviceMetricsOverride", {"width": w, "height": h, "deviceScaleFactor": 1, "mobile": mobile,
                                                         "screenWidth": w, "screenHeight": h})
+        self.cmd("Emulation.setScrollbarsHidden", {"hidden": True})
         if mobile:
             self.cmd("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})
         self.cmd("Emulation.setEmulatedMedia", {"features": [{"name": "prefers-color-scheme", "value": scheme},
                                                              {"name": "prefers-reduced-motion", "value": "no-preference"}]})
         self.base = self.cmd("Emulation.setVirtualTimePolicy", {"policy": "pause", "initialVirtualTime": INITIAL_VIRTUAL_TIME})["virtualTimeTicksBase"]
-        self.ticks = 0
-        self.vt = 0.0
+        self.ticks, self.vt, self.first_png = 0, 0.0, None
 
     def cmd(self, method, params=None):
         return self.c.send(method, params, self.s)
@@ -195,8 +253,19 @@ class Page:
     def js(self, expr):
         r = self.cmd("Runtime.evaluate", {"expression": expr, "returnByValue": True})
         if "exceptionDetails" in r:
-            raise RuntimeError("page script failed: " + json.dumps(r["exceptionDetails"])[:400])
+            raise CouldNotRun("page script failed: " + json.dumps(r["exceptionDetails"])[:400])
         return r["result"].get("value")
+
+    def on_paused(self, p):
+        """A main-frame response held by Fetch interception: keep its status, headers and raw body."""
+        headers = {h["name"].lower(): h["value"] for h in p.get("responseHeaders") or []}
+        rec = {"url": p["request"]["url"], "status": p.get("responseStatusCode"), "content_type": headers.get("content-type"),
+               "error": p.get("responseErrorReason")}
+        if rec["status"] and not (300 <= rec["status"] < 400 and "location" in headers):
+            b = self.cmd("Fetch.getResponseBody", {"requestId": p["requestId"]})
+            rec["body"] = base64.b64decode(b["body"]) if b.get("base64Encoded") else b["body"].encode()
+        self.paused.append(rec)
+        self.cmd("Fetch.continueRequest", {"requestId": p["requestId"]})
 
     def tick(self, screenshot=False):
         self.ticks += 1
@@ -211,31 +280,85 @@ class Page:
         r = self.cmd("HeadlessExperimental.beginFrame", p)
         if screenshot:
             if "screenshotData" not in r:
-                raise RuntimeError("beginFrame returned no screenshot")
-            return base64.b64decode(r["screenshotData"])
+                raise CouldNotRun("beginFrame returned no screenshot")
+            png = base64.b64decode(r["screenshotData"])
+            if INJECT == "blank-frames":
+                w, h, _ = VIEWPORTS[self.viewport]
+                png = png_encode(w, h, b"\xff" * (w * h * 3))
+            if INJECT == "reused-frames":
+                self.first_png = self.first_png or png
+                png = self.first_png
+            return png
 
     def load(self, url, max_ticks=1200):
-        self.cmd("Page.navigate", {"url": url})
+        """Navigate, run frames until the document is complete, and return what Chrome loaded."""
+        self.paused = []
+        nav = self.cmd("Page.navigate", {"url": url})
+        rec = {"url": url, "nav_error": nav.get("errorText")}
+        if nav.get("errorText"):
+            return rec
         for _ in range(max_ticks):
             self.tick()
             if self.js("document.readyState") == "complete":
-                return
-        raise RuntimeError(f"{url} did not finish loading in {max_ticks} frames of virtual time")
+                break
+        else:
+            raise CouldNotRun(f"{url} did not finish loading in {max_ticks} frames of virtual time")
+        docs = [e["params"] for e in self.c.take("Network.responseReceived", self.s)
+                if e["params"].get("type") == "Document" and e["params"].get("frameId") == nav["frameId"]]
+        if not docs:
+            rec["nav_error"] = "no main-frame response seen"
+            return rec
+        resp = docs[-1]["response"]
+        body = self.cmd("Network.getResponseBody", {"requestId": docs[-1]["requestId"]})
+        text = base64.b64decode(body["body"]) if body.get("base64Encoded") else body["body"].encode()
+        rec.update(final_url=resp["url"], status=resp.get("status"), mime=resp.get("mimeType"), text_sha=sha256_bytes(text),
+                   location=self.js("location.href"))
+        final = [r for r in self.paused if "body" in r]
+        if is_url(url):
+            if len(final) != 1:
+                rec["nav_error"] = f"{len(final)} intercepted main-frame bodies"
+                return rec
+            rec.update(raw_sha=sha256_bytes(final[0]["body"]), raw_len=len(final[0]["body"]),
+                       content_type=final[0]["content_type"], fetch_status=final[0]["status"], fetch_url=final[0]["url"])
+        return rec
 
     def close(self):
         self.c.send("Target.closeTarget", {"targetId": self.target})
+        self.c.pages.pop(self.s, None)
+        self.c.events = [e for e in self.c.events if e.get("sessionId") != self.s]
 
 
-SECTIONS_JS = """[...document.querySelectorAll('section')].filter(s=>!s.parentElement.closest('section'))
- .map((s,i)=>s.id?'#'+s.id:'section '+(i+1)+' .'+(s.classList[0]||''))"""
+SECTIONS = "[...document.querySelectorAll('section')].filter(s=>!s.parentElement.closest('section'))"
+LABELS_JS = SECTIONS + ".map((s,i)=>s.id?'#'+s.id:'section '+(i+1)+' .'+(s.classList[0]||''))"
 STATE_JS = """JSON.stringify({theme:document.documentElement.dataset.theme||null,
  stored:(()=>{try{return localStorage.getItem('orbitar-theme')}catch(e){return 'error: '+e.name}})(),
- protocol:location.protocol,scrollY:Math.round(scrollY),height:document.documentElement.scrollHeight})"""
+ protocol:location.protocol})"""
 
 
-def scroll_js(index):
-    return f"""(()=>{{const s=[...document.querySelectorAll('section')].filter(s=>!s.parentElement.closest('section'))[{index}];
- scrollTo({{top:s.getBoundingClientRect().top+scrollY,behavior:'instant'}});return Math.round(scrollY)}})()"""
+def geometry_js(index, scroll):
+    """Scroll (optionally) to top-level section `index` (-1: the top); return the geometry to check."""
+    go = ("scrollTo({top:0,behavior:'instant'})" if index < 0 else
+          f"scrollTo({{top:{SECTIONS}[{index}].getBoundingClientRect().top+scrollY,behavior:'instant'}})")
+    if not scroll or INJECT == "no-scroll":
+        go = "0"
+    marks = json.dumps(list(LANDMARKS))
+    return f"""(()=>{{{go};const de=document.documentElement,s=({index}<0)?null:{SECTIONS}[{index}],r=s?s.getBoundingClientRect():null;
+ const lm={{}};for(const q of {marks}){{const e=document.querySelector(q);if(!e)continue;const b=e.getBoundingClientRect();
+  const x0=Math.max(0,Math.ceil(b.left)),y0=Math.max(0,Math.ceil(b.top)),x1=Math.min(innerWidth,Math.floor(b.right)),y1=Math.min(innerHeight,Math.floor(b.bottom));
+  const area=b.width*b.height;lm[q]={{box:[x0,y0,x1,y1],visible:area>0&&x1>x0&&y1>y0?(x1-x0)*(y1-y0)/area:0}}}}
+ return JSON.stringify({{scrollY:scrollY,max:de.scrollHeight-innerHeight,ih:innerHeight,
+  top:r?r.top:null,bottom:r?r.bottom:null,abs:r?r.top+scrollY:0,landmarks:lm}})}})()"""
+
+
+def geometry_ok(g, is_top):
+    if is_top:
+        return abs(g["scrollY"]) <= 0.5, f"scrollY {g['scrollY']:.0f}, expected 0"
+    want = min(g["abs"], g["max"])
+    clamped = g["abs"] > g["max"] + 1
+    ok = (abs(g["scrollY"] - want) <= 1 and g["top"] < g["ih"] and g["bottom"] > 0
+          and (abs(g["top"]) <= 1 or clamped))
+    return ok, (f"scrollY {g['scrollY']:.0f}, expected {want:.0f}{' (bottom clamp)' if clamped else ''}; "
+                f"section top {g['top']:.0f}, bottom {g['bottom']:.0f}, viewport height {g['ih']}")
 
 
 def frame_ms(t):
@@ -243,38 +366,57 @@ def frame_ms(t):
     return round(round(t / TICK) * TICK, 1)
 
 
-def render_side(binary, url, viewport, scheme, times, flags, positions=None):
+def render_side(binary, url, viewport, scheme, times, flags, positions, click_at):
     """All frames of one side for one viewport and scheme, in one fresh browser profile."""
     chrome = Chrome(binary, flags)
     try:
-        notes = {}
+        loads, notes = [], {}
         if scheme == "dark":
-            p = Page(chrome, viewport, scheme)
-            p.load(url)
+            p = Page(chrome, viewport, scheme, url)
+            loads.append(p.load(url))
             p.js("document.getElementById('site-theme').click()")
             p.tick()
-            notes["after-toggle"] = json.loads(p.js(STATE_JS))
+            notes["after setup toggle"] = json.loads(p.js(STATE_JS))
             p.close()
-        probe = Page(chrome, viewport, scheme)
-        probe.load(url)
-        labels = probe.js(SECTIONS_JS)
+        probe = Page(chrome, viewport, scheme, url)
+        loads.append(probe.load(url))
+        labels = probe.js(LABELS_JS) or []
         probe.close()
-        if positions is None:
-            positions = ["top"] + labels
         frames, states = {}, {}
-        last = max(times)
-        for pi, pos in enumerate(positions):
-            p = Page(chrome, viewport, scheme)
-            p.load(url)
-            y = p.js(scroll_js(labels.index(pos))) if pos != "top" else 0
-            want = {round(t / TICK): t for t in times}
-            for n in range(round(last / TICK) + 1):
+        want = {round(t / TICK): t for t in times}
+        for pos in positions:  # the click run is last: it changes the stored theme
+            if pos not in ("top", CLICK) and pos not in labels:
+                states[pos] = {"missing": True}
+                continue
+            p = Page(chrome, viewport, scheme, url)
+            loads.append(p.load(url))
+            index = -1 if pos in ("top", CLICK) else labels.index(pos)
+            st = {"theme": json.loads(p.js(STATE_JS)), "geo": json.loads(p.js(geometry_js(index, True)))}
+            click_n = round(click_at / TICK) if pos == CLICK else None
+            pending = []
+            for n in range(round(max(times) / TICK) + 1):
                 png = p.tick(screenshot=n in want)
                 if png is not None:
                     frames[(pos, want[n])] = png
-            states[pos] = dict(json.loads(p.js(STATE_JS)), y=y)
+                if pending:  # the click was delivered with this frame
+                    for mid in pending:
+                        chrome.result(mid, "Input.dispatchMouseEvent")
+                    pending = []
+                    st["after click"] = json.loads(p.js(STATE_JS))
+                if n == click_n:
+                    st["before click"] = json.loads(p.js(STATE_JS))
+                    c = p.js("JSON.stringify((b=>{const r=b.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2,r.width,r.height]})(document.getElementById('site-theme')))")
+                    x, y, bw, bh = json.loads(c)
+                    st["click"] = [round(x), round(y), round(bw), round(bh)]
+                    if bw and bh:  # a real mouse click at the toggle's centre
+                        for kind, button, count in (("mouseMoved", "none", 0), ("mousePressed", "left", 1), ("mouseReleased", "left", 1)):
+                            pending.append(chrome.post("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, "button": button,
+                                                                                     "clickCount": count}, p.s))
+            st["geo_end"] = json.loads(p.js(geometry_js(index, False)))
+            st["theme_end"] = json.loads(p.js(STATE_JS))
+            states[pos] = st
             p.close()
-        return positions, frames, states, notes
+        return {"labels": labels, "frames": frames, "states": states, "loads": loads, "notes": notes}
     finally:
         chrome.close()
 
@@ -283,8 +425,9 @@ def render_side(binary, url, viewport, scheme, times, flags, positions=None):
 
 def png_decode(data):
     """(width, height, channels, bytes) of an 8-bit non-interlaced RGB/RGBA PNG."""
-    assert data[:8] == b"\x89PNG\r\n\x1a\n"
-    pos, idat = 8, []
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    pos, idat, w = 8, [], None
     while pos < len(data):
         n = int.from_bytes(data[pos:pos + 4], "big")
         kind, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + n]
@@ -297,8 +440,12 @@ def png_decode(data):
         elif kind == b"IDAT":
             idat.append(body)
         pos += 12 + n
+    if w is None:
+        raise ValueError("PNG without IHDR")
     raw = zlib.decompress(b"".join(idat))
     stride = w * ch
+    if len(raw) != h * (stride + 1):
+        raise ValueError("PNG data has the wrong length")
     out = bytearray(h * stride)
     prev = bytearray(stride)
     for y in range(h):
@@ -319,6 +466,8 @@ def png_decode(data):
                 c = prev[i - ch] if i >= ch else 0
                 pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
                 line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        elif f != 0:
+            raise ValueError("bad PNG filter")
         out[y * stride:(y + 1) * stride] = line
         prev = line
     return w, h, ch, bytes(out)
@@ -332,61 +481,86 @@ def png_encode(w, h, rgb):
             + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
-def compare(a, b, diff_path=None):
-    """(equal pixels, differing pixels, max channel delta)."""
-    if a == b:
-        w, h = int.from_bytes(a[16:20], "big"), int.from_bytes(a[20:24], "big")
-        return w * h, 0, 0
-    wa, ha, ca, pa = png_decode(a)
-    wb, hb, cb, pb = png_decode(b)
-    if (wa, ha) != (wb, hb):
-        return 0, max(wa * ha, wb * hb), 255
-    if ca != cb:
-        raise ValueError("PNG channel counts differ")
-    n, diff, maxd = wa * ha, 0, 0
-    marks = bytearray(n * 3)
-    for i in range(n):
-        x, y = pa[i * ca:i * ca + ca], pb[i * cb:i * cb + cb]
-        if x != y:
-            diff += 1
-            maxd = max(maxd, max(abs(p - q) for p, q in zip(x, y)))
-            marks[i * 3:i * 3 + 3] = b"\xff\x00\x00"
-        else:
-            g = (x[0] + x[1] + x[2]) // 12 + 170
-            marks[i * 3:i * 3 + 3] = bytes((g, g, g))
-    if diff and diff_path:
+def pixel_diff(a, b, diff_path=None):
+    """Differing pixels between two decoded images: (count, max channel delta, bounding box)."""
+    w, h, ch, pa = a
+    _, _, _, pb = b
+    stride = w * ch
+    count, maxd, box = 0, 0, None
+    marks = None
+    for y in range(h):
+        ra, rb = pa[y * stride:(y + 1) * stride], pb[y * stride:(y + 1) * stride]
+        if ra == rb:
+            continue
+        for x in range(w):
+            p, q = ra[x * ch:x * ch + ch], rb[x * ch:x * ch + ch]
+            if p != q:
+                count += 1
+                maxd = max(maxd, max(abs(i - j) for i, j in zip(p, q)))
+                box = [x, y, x, y] if box is None else [min(box[0], x), min(box[1], y), max(box[2], x), max(box[3], y)]
+                if diff_path:
+                    marks = marks or {}
+                    marks[(x, y)] = 1
+    if count and diff_path:
+        rgb = bytearray(w * h * 3)
+        for i in range(w * h):
+            g = (pa[i * ch] + pa[i * ch + 1] + pa[i * ch + 2]) // 12 + 170
+            rgb[i * 3:i * 3 + 3] = b"\xff\x00\x00" if (i % w, i // w) in marks else bytes((g, g, g))
         with open(diff_path, "wb") as f:
-            f.write(png_encode(wa, ha, bytes(marks)))
-    return n - diff, diff, maxd
+            f.write(png_encode(w, h, bytes(rgb)))
+    return count, maxd, box
 
 
-# ---------------------------------------------------------------- the checks
+def crop(img, box):
+    w, h, ch, px = img
+    x0, y0, x1, y1 = box
+    return b"".join(px[(y * w + x0) * ch:(y * w + x1) * ch] for y in range(y0, y1))
 
-def check_bytes(ref, target, expect_ct):
-    want = sha256_bytes(open(ref, "rb").read())
-    lines, ok = [f"reference {os.path.basename(ref)} sha256 {want}"], True
-    if is_url(target):
-        with tempfile.TemporaryDirectory() as d:
-            body = os.path.join(d, "body")
-            r = subprocess.run(["curl", "--compressed", "-fsSL", "-o", body, "-w", "%{http_code} %{content_type} %{url_effective}",
-                                target], capture_output=True, text=True)
-            if r.returncode:
-                return False, lines + [f"curl {target} failed: {r.stderr.strip()}"]
-            code, rest = r.stdout.split(" ", 1)
-            ct, final = rest.rsplit(" ", 1)
-            got = sha256_bytes(open(body, "rb").read())
-            size = os.path.getsize(body)
-        lines.append(f"served    {final} (HTTP {code}) sha256 {got}, {size} bytes")
-        ct_ok = ct.strip().lower().replace(" ", "") == expect_ct.lower().replace(" ", "")
-        lines.append(f"Content-Type: {ct.strip()} ({'as expected' if ct_ok else 'expected ' + expect_ct})")
-        ok = got == want and ct_ok
-    else:
-        got = sha256_bytes(open(target, "rb").read())
-        lines.append(f"target    {target} sha256 {got}")
-        ok = got == want
-    lines.append("bytes: " + ("identical" if got == want else "DIFFERENT"))
-    return ok, lines
 
+def analyse_run(job):
+    """Validate and compare all captures of one (viewport, scheme, position) run, on all three sides."""
+    vp, scheme, pos, times, pngs, landmarks, out, tag = job
+    w, h, _ = VIEWPORTS[vp]
+    problems, rows, decoded = [], [], {}
+    for side, seq in pngs.items():
+        decoded[side] = []
+        for t, png in zip(times, seq):
+            try:
+                img = png_decode(png)
+            except Exception as e:
+                problems.append(("captures", f"{side} {t} ms: {e}"))
+                img = None
+            if img:
+                if (img[0], img[1]) != (w, h):
+                    problems.append(("captures", f"{side} {t} ms: {img[0]}x{img[1]}, expected {w}x{h}"))
+                elif img[3] == img[3][:img[2]] * (w * h):
+                    problems.append(("captures", f"{side} {t} ms: one uniform colour"))
+            decoded[side].append(img)
+    steps = 0
+    for side, marks in landmarks.items():
+        for name, box in marks:
+            for i in range(1, len(times) if LANDMARKS[name][0] == "every" else min(2, len(times))):
+                a, b = decoded[side][i - 1], decoded[side][i]
+                steps += 1
+                if not (a and b) or crop(a, box) == crop(b, box):
+                    problems.append(("motion", f"{side}: {name} {box} unchanged {frame_ms(times[i - 1])} -> {frame_ms(times[i])} ms"))
+    for i, t in enumerate(times):
+        r1, r2, tg = decoded["ref1"][i], decoded["ref2"][i], decoded["target"][i]
+        res = {}
+        for key, other in (("control", r2), ("frames", tg)):
+            if r1 is None or other is None or (r1[0], r1[1]) != (other[0], other[1]):
+                res[key] = (w * h, 255, None)
+            elif pngs["ref1"][i] == (pngs["ref2"] if key == "control" else pngs["target"])[i] or r1[3] == other[3]:
+                res[key] = (0, 0, None)
+            else:
+                res[key] = pixel_diff(r1, other, os.path.join(out, f"{tag}-{t}ms-{key}-diff.png"))
+                for name, png in (("ref1", pngs["ref1"][i]), ("ref2", pngs["ref2"][i]), ("target", pngs["target"][i])):
+                    open(os.path.join(out, f"{tag}-{t}ms-{name}.png"), "wb").write(png)
+        rows.append((t, sha256_bytes(pngs["ref1"][i])[:8], res["control"], res["frames"]))
+    return vp, scheme, pos, rows, problems, steps
+
+
+# ---------------------------------------------------------------- the run
 
 def free_port():
     with socket.socket() as s:
@@ -394,20 +568,248 @@ def free_port():
         return s.getsockname()[1]
 
 
+def check_loads(side, loads, ref_bytes, expect_ct, target_is_url):
+    """Every main-frame load of one side against the reference bytes."""
+    want, want_text = sha256_bytes(ref_bytes), sha256_bytes(ref_bytes.decode("utf-8").encode("utf-8"))
+    bad = []
+    for i, r in enumerate(loads):
+        if r.get("nav_error"):
+            bad.append(f"{side} load {i}: {r['url']}: {r['nav_error']}")
+            continue
+        if r["status"] != 200 and not (r["final_url"].startswith("file:") and r["status"] in (0, None)):
+            bad.append(f"{side} load {i}: HTTP status {r['status']}")
+        if r["text_sha"] != want_text:
+            bad.append(f"{side} load {i}: document text sha256 {r['text_sha'][:12]}, reference {want_text[:12]}")
+        if target_is_url:
+            if r["raw_sha"] != want:
+                bad.append(f"{side} load {i}: body sha256 {r['raw_sha'][:12]} ({r['raw_len']} bytes), reference {want[:12]} ({len(ref_bytes)} bytes)")
+            if r["fetch_status"] != 200:
+                bad.append(f"{side} load {i}: intercepted status {r['fetch_status']}")
+            ct = (r["content_type"] or "").lower().replace(" ", "")
+            if ct != expect_ct.lower().replace(" ", ""):
+                bad.append(f"{side} load {i}: Content-Type {r['content_type']!r}, expected {expect_ct!r}")
+    return bad
+
+
+def main_run(a, out, target):
+    ref_bytes = open(a.reference, "rb").read()
+    version = subprocess.run([a.chrome, "--version"], capture_output=True, text=True).stdout.strip()
+    flags = ["--no-sandbox"] if os.environ.get("VERIFY_PAGE_IN_DOCKER") or os.geteuid() == 0 else []
+    times = [int(t) for t in a.times.split(",")]
+    expected = [s for s in a.expect_sections.split(",") if s]
+    ref_url = pathlib.Path(a.reference).as_uri()
+    tgt_url = target if is_url(target) else pathlib.Path(target).as_uri()
+    checks = {k: [] for k in ("bytes", "sections", "scroll", "captures", "motion", "theme", "control", "frames")}
+    notes, jobs, loads_seen = [], [], {"reference": 0, "target": 0}
+    target_info = None
+    for vp in a.viewports.split(","):
+        for scheme in a.schemes.split(","):
+            t0 = time.time()
+            positions = a.positions.split(",") if a.positions else ["top"] + (expected or [])
+            if not a.positions and not expected:
+                raise CouldNotRun("give --positions when --expect-sections is empty")
+            if a.click_at >= 0 and CLICK not in positions:
+                positions.append(CLICK)
+            sides = {}
+            for side, url in (("ref1", ref_url), ("ref2", ref_url), ("target", tgt_url)):
+                sides[side] = render_side(a.chrome, url, vp, scheme, times, flags, positions, a.click_at)
+            for side, d in sides.items():
+                who = "reference" if side != "target" else "target"
+                checks["bytes"] += check_loads(side, d["loads"], ref_bytes, a.expect_content_type, side == "target" and is_url(target))
+                loads_seen[who] += len(d["loads"])
+                if side == "target" and d["loads"] and not d["loads"][-1].get("nav_error"):
+                    target_info = d["loads"][-1]
+                if expected and d["labels"] != expected:
+                    checks["sections"].append(f"{vp} {scheme} {side}: sections {d['labels']}, expected {expected}")
+                for pos in positions:
+                    st = d["states"][pos]
+                    if st.get("missing"):
+                        checks["sections"].append(f"{vp} {scheme} {side}: no section {pos}")
+                        continue
+                    for when, g in (("after scroll", st["geo"]), ("after last frame", st["geo_end"])):
+                        ok, why = geometry_ok(g, pos in ("top", CLICK))
+                        if not ok:
+                            checks["scroll"].append(f"{vp} {scheme} {side} {pos} {when}: {why}")
+                    themes = [st["theme"]["theme"]] + ([] if pos == CLICK else [st["theme_end"]["theme"]])
+                    if any(t != scheme for t in themes):
+                        checks["theme"].append(f"{vp} {scheme} {side} {pos}: data-theme {themes}")
+                    if pos == CLICK:
+                        flipped = "light" if scheme == "dark" else "dark"
+                        after = st.get("after click", {})
+                        if after.get("theme") != flipped or after.get("stored") != flipped or st["theme_end"]["theme"] != flipped:
+                            checks["theme"].append(f"{vp} {scheme} {side} click: before {st.get('before click')}, after {after}, end {st['theme_end']}")
+                ys = {}
+                for pos in positions:
+                    st = d["states"][pos]
+                    if pos not in ("top", CLICK) and not st.get("missing"):
+                        ys.setdefault(round(st["geo"]["scrollY"]), []).append((pos, st["geo"]))
+                for y, ps in ys.items():
+                    if len(ps) > 1 and not all(g["abs"] > g["max"] + 1 or abs(g["scrollY"] - g["max"]) <= 1 for _, g in ps):
+                        checks["scroll"].append(f"{vp} {scheme} {side}: {[p for p, _ in ps]} all at scrollY {y}")
+                notes.append(f"{vp} {scheme} {side}: {len(d['loads'])} loads, data-theme "
+                             f"{sorted({str(d['states'][p].get('theme', {}).get('theme')) for p in positions})}"
+                             + "".join(f"; {k} {v}" for k, v in d['notes'].items())
+                             + (f"; click at {d['states'][CLICK].get('click')} → {d['states'][CLICK].get('after click')}" if CLICK in positions and not d['states'][CLICK].get('missing') else ""))
+            for pos in positions:
+                if any(sides[s]["states"][pos].get("missing") for s in sides):
+                    continue
+                pngs = {s: [sides[s]["frames"][(pos, t)] for t in times] for s in sides}
+                if INJECT == "ref-control" and pos == positions[0]:
+                    w, h, ch, px = png_decode(pngs["ref2"][0])
+                    px = bytearray(px)
+                    px[0] ^= 0x40
+                    pngs["ref2"][0] = png_encode(w, h, bytes(px) if ch == 3 else bytes(b for i, b in enumerate(px) if i % 4 != 3))
+                marks = {}
+                for s in sides:
+                    lm = sides[s]["states"][pos]["geo"]["landmarks"]
+                    marks[s] = [(q, v["box"]) for q, v in lm.items() if v["visible"] >= LANDMARKS[q][1]]
+                tag = f"{vp}-{scheme}-{pos.strip('#').replace(' + ', '-').replace(' ', '_').replace('.', '')}"
+                jobs.append((vp, scheme, pos, times, pngs, marks, out, tag))
+            print(f"{vp} {scheme}: {len(positions)} positions x {len(times)} times rendered on 3 sides, {time.time() - t0:.0f}s",
+                  file=sys.stderr, flush=True)
+
+    t0 = time.time()
+    with multiprocessing.Pool(max(1, min(8, os.cpu_count() or 1))) as pool:
+        results = pool.map(analyse_run, jobs)
+    print(f"captures decoded, validated and compared in {time.time() - t0:.0f}s", file=sys.stderr, flush=True)
+    rows, groups_moved, landmark_runs, landmark_checks = [], 0, 0, 0
+    for (vp, scheme, pos, rr, problems, steps), job in zip(results, jobs):
+        for kind, msg in problems:
+            checks[kind].append(f"{vp} {scheme} {pos}: {msg}")
+        landmark_runs += 1 if any(job[5].values()) else 0
+        landmark_checks += steps
+        hashes = {r[1] for r in rr}
+        groups_moved += len(hashes) > 1
+        for t, h, ctl, frm in rr:
+            if ctl[0]:
+                checks["control"].append(f"{vp} {scheme} {pos} {frame_ms(t)} ms: {ctl[0]} px (max channel Δ {ctl[1]}, box {ctl[2]})")
+            if frm[0]:
+                checks["frames"].append(f"{vp} {scheme} {pos} {frame_ms(t)} ms: {frm[0]} px (max channel Δ {frm[1]}, box {frm[2]})")
+            rows.append((vp, scheme, pos, t, h, ctl, frm))
+
+    w_total = {vp: VIEWPORTS[vp][0] * VIEWPORTS[vp][1] for vp in VIEWPORTS}
+    table = ["| viewport | scheme | position | t (ms) | frame sha256 | ref vs ref: differing px | ref vs target: equal px | differing px | |",
+             "|---|---|---|---:|---|---:|---:|---:|---|"]
+    for vp, scheme, pos, t, h, ctl, frm in rows:
+        vw, vh, _ = VIEWPORTS[vp]
+        ok = not ctl[0] and not frm[0]
+        table.append(f"| {vp} {vw}x{vh} | {scheme} | {pos} | {frame_ms(t)} | {h} | {ctl[0]:,} | {w_total[vp] - frm[0]:,} | {frm[0]:,} | {'equal' if ok else 'DIFFERS'} |")
+    summary = {
+        "bytes": f"{loads_seen['reference']} reference loads and {loads_seen['target']} target loads"
+                 + (f"; target: {target_info.get('final_url')}, HTTP {target_info.get('status')}, Content-Type {target_info.get('content_type')!r}, "
+                    f"body sha256 {target_info.get('raw_sha') or target_info.get('text_sha')}" if target_info else ""),
+        "sections": f"{len(expected)} expected: {', '.join(expected)}" if expected else "not asserted (--expect-sections '')",
+        "scroll": "each position's scrollY and section/viewport intersection, after the scroll and after the last frame",
+        "captures": f"{3 * len(rows)} captures decoded; size and non-uniformity checked",
+        "motion": f"moving landmarks ({', '.join(f'{q} {r} at {v:.0%}' for q, (r, v) in LANDMARKS.items())}) on screen in "
+                  f"{landmark_runs} of {len(results)} runs, {landmark_checks} landmark steps checked; "
+                  f"in {groups_moved} of {len(results)} runs the frame changes over time",
+        "theme": "data-theme on every load" + ("; the click flips it and stores it" if a.click_at >= 0 else ""),
+        "control": f"{len(rows)} reference frames vs an independent second rendering",
+        "frames": f"{len(rows)} reference frames vs the target",
+    }
+    verdict = "PASS" if not any(checks.values()) else "FAIL"
+    lines = ["## Checks"]
+    for k, problems in checks.items():
+        lines.append(f"{'FAIL' if problems else 'PASS'} {k}: {summary[k]}" + (f"; {len(problems)} problems" if problems else ""))
+        lines += ["    " + p for p in problems[:40]] + (["    ..."] if len(problems) > 40 else [])
+    report = [f"reference: {ref_url}", f"target:    {tgt_url}",
+              f"browser:   {version}, --deterministic-mode, virtual time, one beginFrame per 16.7 ms tick, scrollbars hidden, device scale 1",
+              "t = virtual ms since the first frame after load (top) or after the scroll; the frame nearest the asked time"
+              + (f"; the click run clicks #site-theme right after the {frame_ms(a.click_at)} ms frame" if a.click_at >= 0 else ""),
+              "", *lines, "", "## Loads and theme", *("    " + n for n in notes), "", "## Frames", *table, "", f"Overall: {verdict}"]
+    text = "\n".join(report)
+    open(os.path.join(out, "report.md"), "w").write(text + "\n")
+    print(text)
+    print(f"\nreport and any differing frames: {out}")
+    return 0 if verdict == "PASS" else 1
+
+
+# ---------------------------------------------------------------- --self-test
+
+class SplitHandler(http.server.BaseHTTPRequestHandler):
+    """Serves the reference to most clients, and a copy with an invisible comment to Chrome."""
+    good = bad = b""
+
+    def do_GET(self):
+        body = self.bad if "Chrome" in (self.headers.get("User-Agent") or "") else self.good
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def self_test(a, out):
+    ref = open(a.reference, "rb").read()
+    work = tempfile.mkdtemp(prefix="self-test-", dir=out)
+    one_px = os.path.join(work, "one-pixel")
+    os.makedirs(one_px)
+    marker = b"</body>"
+    if marker not in ref:
+        raise CouldNotRun("reference has no </body> to put the one-pixel overlay before")
+    open(os.path.join(one_px, "index.html"), "wb").write(ref.replace(
+        marker, b'<div style="position:fixed;left:0;top:0;width:1px;height:1px;background:#f0f;z-index:99999"></div>' + marker, 1))
+    SplitHandler.good, SplitHandler.bad = ref, ref.replace(marker, b"<!-- not the owner's bytes -->" + marker, 1)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SplitHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    split_url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    small = ["--viewports", "desktop", "--schemes", "light", "--times", "0,250,500", "--positions", "top,#architecture",
+             "--click-at", "250", "--expect-sections", a.expect_sections, "--chrome", a.chrome]
+    cases = [  # name, target args, injected fault, expected exit, a line the report must contain
+        ("clean: reference vs itself", [a.reference], "", 0, "Overall: PASS"),
+        ("reference control mismatch (one pixel of one reference frame)", [a.reference], "ref-control", 1, "FAIL control"),
+        ("Chrome gets other bytes than other clients", [split_url], "", 1, "FAIL bytes"),
+        ("scroll does nothing", [a.reference], "no-scroll", 1, "FAIL scroll"),
+        ("captures are blank", [a.reference], "blank-frames", 1, "FAIL captures"),
+        ("captures are reused across times", [a.reference], "reused-frames", 1, "FAIL motion"),
+        ("target has a one-pixel overlay", ["--serve", one_px, "--expect-content-type", "text/html"], "", 1, "FAIL frames"),
+    ]
+    results = []
+    for i, (name, target, fault, want_rc, want_line) in enumerate(cases):
+        t0 = time.time()
+        env = dict(os.environ, VERIFY_PAGE_INJECT=fault)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), a.reference, *target, *small,
+                            "--out", os.path.join(work, f"case{i}")], capture_output=True, text=True, env=env)
+        caught = r.returncode == want_rc and want_line in r.stdout
+        out_lines = r.stdout.splitlines()
+        at = next((i for i, l in enumerate(out_lines) if l.startswith(want_line)), None)
+        detail = "" if at is None else (out_lines[at].split(":")[0] if want_line.startswith("FAIL") else out_lines[at]) + (
+            " — " + out_lines[at + 1].strip() if at + 1 < len(out_lines) and out_lines[at + 1].startswith("    ") else "")
+        results.append((name, fault or "-", want_rc, r.returncode, caught, detail))
+        print(f"{'ok  ' if caught else 'MISS'} {name}: exit {r.returncode} (want {want_rc}) {detail[:160]} [{time.time() - t0:.0f}s]", flush=True)
+        if not caught:
+            print(r.stdout[-3000:], r.stderr[-2000:], sep="\n")
+    srv.shutdown()
+    lines = ["| case | injected | expected exit | exit | caught | report line |", "|---|---|---:|---:|---|---|"]
+    lines += [f"| {n} | {f} | {w} | {g} | {'yes' if c else 'NO'} | {d[:160].replace('|', '/')} |" for n, f, w, g, c, d in results]
+    ok = all(r[4] for r in results)
+    text = "\n".join(["## Self-test", *lines, "", f"Self-test: {'PASS' if ok else 'FAIL'}"])
+    open(os.path.join(out, "self-test.md"), "w").write(text + "\n")
+    print(text)
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("reference")
     ap.add_argument("target", nargs="?")
     ap.add_argument("--serve", metavar="DIR", help="serve DIR with python3 -m http.server and test it")
+    ap.add_argument("--self-test", action="store_true", help="inject one fault per check and require that each is caught")
     ap.add_argument("--expect-content-type", default="text/html; charset=utf-8")
-    ap.add_argument("--times", default="0,250,500,1000,2000,4000,8000", help="ms, comma separated")
+    ap.add_argument("--expect-sections", default=EXPECTED_SECTIONS, help="comma separated; '' to skip")
+    ap.add_argument("--times", default=DEFAULT_TIMES, help="ms, comma separated")
+    ap.add_argument("--click-at", type=int, default=1000, help="ms of the theme toggle click run; -1 for none")
     ap.add_argument("--viewports", default="desktop,mobile")
     ap.add_argument("--schemes", default="light,dark")
-    ap.add_argument("--out", help="where frames that differ, and the report, are written (default: a new directory)")
-    ap.add_argument("--save-frames", action="store_true", help="also write every reference frame to --out")
+    ap.add_argument("--positions", default="", help="comma separated subset (top, section labels); default: all")
+    ap.add_argument("--out", help="where the report and frames that differ are written (default: a new directory)")
     ap.add_argument("--chrome", help="chrome-headless-shell binary (Linux); without it the script runs in Docker")
     a = ap.parse_args()
-    if bool(a.target) == bool(a.serve):
+    if not a.self_test and bool(a.target) == bool(a.serve):
         ap.error("give either TARGET or --serve DIR")
     a.reference = os.path.abspath(a.reference)
     if not os.path.isfile(a.reference):
@@ -420,13 +822,16 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     if not a.chrome:
-        argv = [a.reference] + ([a.target] if a.target else ["--serve", a.serve])
-        argv += ["--expect-content-type", a.expect_content_type, "--times", a.times, "--viewports", a.viewports,
-                 "--schemes", a.schemes, "--out", out] + (["--save-frames"] if a.save_frames else [])
+        argv = [a.reference] + ([a.target] if a.target else ["--serve", a.serve] if a.serve else [])
+        argv += ["--expect-content-type", a.expect_content_type, "--expect-sections", a.expect_sections, "--times", a.times,
+                 "--click-at", str(a.click_at), "--viewports", a.viewports, "--schemes", a.schemes, "--positions", a.positions,
+                 "--out", out] + (["--self-test"] if a.self_test else [])
         run_in_docker(argv, [a.reference] + [p for p in (a.serve, a.target) if p and not is_url(p)], out)
 
     server = None
     try:
+        if a.self_test:
+            return self_test(a, out)
         target = a.target
         if a.serve:
             port = free_port()
@@ -440,72 +845,10 @@ def main():
                 except OSError:
                     time.sleep(0.1)
             print(f"serving {a.serve} with python3 -m http.server at {target}")
-        version = subprocess.run([a.chrome, "--version"], capture_output=True, text=True).stdout.strip()
-        flags = ["--no-sandbox"] if os.environ.get("VERIFY_PAGE_IN_DOCKER") or os.geteuid() == 0 else []
-        bytes_ok, lines = check_bytes(a.reference, target, a.expect_content_type)
-        report = ["## Bytes", *("    " + l for l in lines), ""]
-        print("\n".join(report), flush=True)
-
-        times = [int(t) for t in a.times.split(",")]
-        ref_url = "file://" + a.reference
-        tgt_url = target if is_url(target) else "file://" + target
-        rows, all_ok, notes = [], True, []
-        for vp in a.viewports.split(","):
-            for scheme in a.schemes.split(","):
-                t0 = time.time()
-                pos, ref1, st1, n1 = render_side(a.chrome, ref_url, vp, scheme, times, flags)
-                _, ref2, st2, n2 = render_side(a.chrome, ref_url, vp, scheme, times, flags, pos)
-                _, tgt, st3, n3 = render_side(a.chrome, tgt_url, vp, scheme, times, flags, pos)
-                for side, st, n in (("reference", st1, n1), ("target", st3, n3)):
-                    themes = sorted({s["theme"] for s in st.values()})
-                    stored = sorted({str(s["stored"]) for s in st.values()})
-                    notes.append(f"{vp} {scheme} {side}: data-theme {themes}, localStorage orbitar-theme {stored}, "
-                                 f"protocol {sorted({s['protocol'] for s in st.values()})}"
-                                 + (f", after toggle {n['after-toggle']}" if n else ""))
-                    if themes != [scheme]:
-                        all_ok = False
-                        notes.append(f"  FAIL: expected data-theme {scheme}")
-                for p in pos:
-                    for t in times:
-                        k = (p, t)
-                        tag = f"{vp}-{scheme}-{p.strip('#').replace(' ', '_').replace('.', '')}-{t}ms"
-                        self_eq, self_diff, self_max = compare(ref1[k], ref2[k], os.path.join(out, tag + "-self-diff.png"))
-                        eq, diff, mx = compare(ref1[k], tgt[k], os.path.join(out, tag + "-diff.png"))
-                        if self_diff or diff:
-                            for name, png in (("ref1", ref1[k]), ("ref2", ref2[k]), ("target", tgt[k])):
-                                open(os.path.join(out, f"{tag}-{name}.png"), "wb").write(png)
-                        ok = diff == 0
-                        all_ok &= ok
-                        if a.save_frames:
-                            open(os.path.join(out, f"{tag}-ref1.png"), "wb").write(ref1[k])
-                        rows.append((vp, scheme, f"{p} (y={st1[p]['y']})", frame_ms(t), sha256_bytes(ref1[k])[:8], self_eq, self_diff, eq, diff, mx, ok))
-                print(f"{vp} {scheme}: {len(pos)} positions x {len(times)} times, {time.time() - t0:.0f}s", file=sys.stderr, flush=True)
-
-        table = ["| viewport | scheme | position (scrollY) | t (ms) | frame sha256 | ref vs ref: equal px | differing px | ref vs target: equal px | differing px | |",
-                 "|---|---|---|---:|---|---:|---:|---:|---:|---|"]
-        for vp, scheme, p, t, h, se, sd, eq, d, mx, ok in rows:
-            vw, vh, _ = VIEWPORTS[vp]
-            table.append(f"| {vp} {vw}x{vh} | {scheme} | {p} | {t} | {h} | {se:,} | {sd:,} | {eq:,} | {d:,}" +
-                         (f" (max channel Δ {mx})" if d else "") + f" | {'equal' if ok else 'DIFFERS'} |")
-        self_bad = sum(1 for r in rows if r[6])
-        groups = {}
-        for r in rows:
-            groups.setdefault(r[:3], set()).add(r[4])
-        moving = sum(1 for g in groups.values() if len(g) > 1)
-        verdict = "PASS" if bytes_ok and all_ok else "FAIL"
-        report += ["## Frames", f"    browser: {version}, --deterministic-mode, virtual time, one beginFrame per 16.7 ms tick, device scale 1",
-                   "    t = virtual ms since the first frame after load (top) or after the scroll; the frame nearest the asked time",
-                   f"    reference: {ref_url}", f"    target:    {tgt_url}",
-                   f"    {len(rows)} frames per side; reference vs itself: {len(rows) - self_bad} identical, {self_bad} differing;"
-                   f" reference vs target: {sum(1 for r in rows if r[10])} identical, {sum(1 for r in rows if not r[10])} differing",
-                   f"    animation: in {moving} of {len(groups)} (viewport, scheme, position) runs the frame changes between the captured times;"
-                   f" {len({r[4] for r in rows})} distinct frames in all",
-                   *("    " + n for n in notes), "", *table, "", f"Overall: {verdict}"]
-        text = "\n".join(report)
-        open(os.path.join(out, "report.md"), "w").write(text + "\n")
-        print("\n".join(report[report.index("## Frames"):]))
-        print(f"\nreport and any differing frames: {out}")
-        return 0 if verdict == "PASS" else 1
+        return main_run(a, out, target)
+    except CouldNotRun as e:
+        print(f"verify-page: could not run: {e}", file=sys.stderr)
+        return 2
     finally:
         if server:
             server.terminate()
