@@ -20,15 +20,19 @@ workers are bypassed.
 
 The matrix: viewports desktop 1440x900 and mobile 390x844 (touch, device scale 1) x light and dark x
 positions (the top, each top-level <section> scrolled to, and the top with a real mouse click on the
-theme toggle at --click-at ms) x --times (ms after the first frame following load or scroll).
+theme toggle at --click-at ms) x --times (ms after the first frame following load or scroll); the click
+run also captures --click-at + 500 ms, whatever --times is.
 Dark: prefers-color-scheme is emulated as dark and the page's own toggle (#site-theme) is clicked once
 in that fresh browser profile, so later loads take the theme from the page's localStorage, as for a
 returning visitor. The reference is rendered twice, in independent browsers (the reference control),
 then the target once. The verdict is PASS only if every check passes:
 
   bytes          every load's main-frame response, as Chrome received it: final URL, HTTP status 200,
-                 Content-Type (--expect-content-type, http(s) only), sha256 of the body (Fetch
-                 interception for http(s); the decoded document text for file:) equal to the reference
+                 Content-Type (--expect-content-type, http(s) only), sha256 of the raw body (Fetch
+                 interception, http(s)) and of the decoded document text equal to the reference; for a
+                 file: target also the file's bytes on disk
+  navigation     from navigation to after the last capture, each load's main frame had exactly one
+                 document response and one commit (the checked ones): no refresh or redirect later
   sections       each side's top-level sections are --expect-sections
   scroll         each position is reached: scrollY is the section's top (or the bottom clamp), the
                  section intersects the viewport, right after the scroll and after the last frame
@@ -293,7 +297,10 @@ class Page:
     def load(self, url, max_ticks=1200):
         """Navigate, run frames until the document is complete, and return what Chrome loaded."""
         self.paused = []
+        self.c.take("Page.frameNavigated", self.s)
+        self.c.take("Network.responseReceived", self.s)
         nav = self.cmd("Page.navigate", {"url": url})
+        self.url, self.main_frame, self.docs, self.commits = url, nav.get("frameId"), [], []
         rec = {"url": url, "nav_error": nav.get("errorText")}
         if nav.get("errorText"):
             return rec
@@ -303,8 +310,8 @@ class Page:
                 break
         else:
             raise CouldNotRun(f"{url} did not finish loading in {max_ticks} frames of virtual time")
-        docs = [e["params"] for e in self.c.take("Network.responseReceived", self.s)
-                if e["params"].get("type") == "Document" and e["params"].get("frameId") == nav["frameId"]]
+        self._collect()
+        docs = self.docs
         if not docs:
             rec["nav_error"] = "no main-frame response seen"
             return rec
@@ -312,7 +319,7 @@ class Page:
         body = self.cmd("Network.getResponseBody", {"requestId": docs[-1]["requestId"]})
         text = base64.b64decode(body["body"]) if body.get("base64Encoded") else body["body"].encode()
         rec.update(final_url=resp["url"], status=resp.get("status"), mime=resp.get("mimeType"), text_sha=sha256_bytes(text),
-                   location=self.js("location.href"))
+                   location=self.js("location.href"), loader=docs[-1].get("loaderId"))
         final = [r for r in self.paused if "body" in r]
         if is_url(url):
             if len(final) != 1:
@@ -321,6 +328,28 @@ class Page:
             rec.update(raw_sha=sha256_bytes(final[0]["body"]), raw_len=len(final[0]["body"]),
                        content_type=final[0]["content_type"], fetch_status=final[0]["status"], fetch_url=final[0]["url"])
         return rec
+
+    def _collect(self):
+        self.docs += [e["params"] for e in self.c.take("Network.responseReceived", self.s)
+                      if e["params"].get("type") == "Document" and e["params"].get("frameId") == self.main_frame]
+        self.commits += [e["params"]["frame"] for e in self.c.take("Page.frameNavigated", self.s)
+                         if not e["params"]["frame"].get("parentId")]
+
+    def document_changes(self):
+        """From navigation to now (after the last capture), the main frame must have had exactly one document
+        response and one commit, the checked ones; anything else means the frames may show another document."""
+        self._collect()
+        bad = []
+        if len(self.docs) != 1:
+            bad.append(f"{len(self.docs)} main-frame document responses: {[d['response']['url'] for d in self.docs]}")
+        if len(self.commits) != 1:
+            bad.append(f"{len(self.commits)} main-frame commits: {[(f.get('url'), f.get('loaderId')) for f in self.commits]}")
+        elif self.docs and self.commits[0].get("loaderId") != self.docs[0].get("loaderId"):
+            bad.append(f"committed loader {self.commits[0].get('loaderId')} is not the checked response's {self.docs[0].get('loaderId')}")
+        bodies = [r["url"] for r in self.paused if "body" in r]
+        if is_url(self.url) and len(bodies) != 1:
+            bad.append(f"{len(bodies)} intercepted main-frame bodies: {bodies}")
+        return bad
 
     def close(self):
         self.c.send("Target.closeTarget", {"targetId": self.target})
@@ -361,6 +390,14 @@ def geometry_ok(g, is_top):
                 f"section top {g['top']:.0f}, bottom {g['bottom']:.0f}, viewport height {g['ih']}")
 
 
+POST_CLICK = 500  # ms after the click: the click run always captures this frame too
+
+
+def run_times(pos, times, click_at):
+    """The capture times of one run: --times, and for the click run also click_at + POST_CLICK."""
+    return times if pos != CLICK else sorted(set(times) | {click_at + POST_CLICK})
+
+
 def frame_ms(t):
     """The virtual time of the frame captured for a requested time t: the nearest 16.7 ms tick."""
     return round(round(t / TICK) * TICK, 1)
@@ -377,13 +414,14 @@ def render_side(binary, url, viewport, scheme, times, flags, positions, click_at
             p.js("document.getElementById('site-theme').click()")
             p.tick()
             notes["after setup toggle"] = json.loads(p.js(STATE_JS))
+            loads[-1]["late"] = p.document_changes()
             p.close()
         probe = Page(chrome, viewport, scheme, url)
         loads.append(probe.load(url))
         labels = probe.js(LABELS_JS) or []
+        loads[-1]["late"] = probe.document_changes()
         probe.close()
         frames, states = {}, {}
-        want = {round(t / TICK): t for t in times}
         for pos in positions:  # the click run is last: it changes the stored theme
             if pos not in ("top", CLICK) and pos not in labels:
                 states[pos] = {"missing": True}
@@ -393,11 +431,14 @@ def render_side(binary, url, viewport, scheme, times, flags, positions, click_at
             index = -1 if pos in ("top", CLICK) else labels.index(pos)
             st = {"theme": json.loads(p.js(STATE_JS)), "geo": json.loads(p.js(geometry_js(index, True)))}
             click_n = round(click_at / TICK) if pos == CLICK else None
-            pending = []
-            for n in range(round(max(times) / TICK) + 1):
+            pending, want = [], {}
+            for t in run_times(pos, times, click_at):
+                want.setdefault(round(t / TICK), []).append(t)
+            for n in range(max(want) + 1):
                 png = p.tick(screenshot=n in want)
                 if png is not None:
-                    frames[(pos, want[n])] = png
+                    for t in want[n]:
+                        frames[(pos, t)] = png
                 if pending:  # the click was delivered with this frame
                     for mid in pending:
                         chrome.result(mid, "Input.dispatchMouseEvent")
@@ -415,6 +456,8 @@ def render_side(binary, url, viewport, scheme, times, flags, positions, click_at
             st["geo_end"] = json.loads(p.js(geometry_js(index, False)))
             st["theme_end"] = json.loads(p.js(STATE_JS))
             states[pos] = st
+            loads[-1]["late"] = p.document_changes()
+            loads[-1]["position"] = pos
             p.close()
         return {"labels": labels, "frames": frames, "states": states, "loads": loads, "notes": notes}
     finally:
@@ -599,9 +642,14 @@ def main_run(a, out, target):
     expected = [s for s in a.expect_sections.split(",") if s]
     ref_url = pathlib.Path(a.reference).as_uri()
     tgt_url = target if is_url(target) else pathlib.Path(target).as_uri()
-    checks = {k: [] for k in ("bytes", "sections", "scroll", "captures", "motion", "theme", "control", "frames")}
+    checks = {k: [] for k in ("bytes", "navigation", "sections", "scroll", "captures", "motion", "theme", "control", "frames")}
     notes, jobs, loads_seen = [], [], {"reference": 0, "target": 0}
     target_info = None
+    if not is_url(target):
+        disk = open(target, "rb").read()
+        if disk != ref_bytes:
+            checks["bytes"].append(f"target file on disk: sha256 {sha256_bytes(disk)} ({len(disk)} bytes), "
+                                   f"reference {sha256_bytes(ref_bytes)} ({len(ref_bytes)} bytes)")
     for vp in a.viewports.split(","):
         for scheme in a.schemes.split(","):
             t0 = time.time()
@@ -616,6 +664,8 @@ def main_run(a, out, target):
             for side, d in sides.items():
                 who = "reference" if side != "target" else "target"
                 checks["bytes"] += check_loads(side, d["loads"], ref_bytes, a.expect_content_type, side == "target" and is_url(target))
+                for i, r in enumerate(d["loads"]):
+                    checks["navigation"] += [f"{vp} {scheme} {side} load {i} ({r.get('position', 'setup')}): {m}" for m in r.get("late", [])]
                 loads_seen[who] += len(d["loads"])
                 if side == "target" and d["loads"] and not d["loads"][-1].get("nav_error"):
                     target_info = d["loads"][-1]
@@ -653,7 +703,8 @@ def main_run(a, out, target):
             for pos in positions:
                 if any(sides[s]["states"][pos].get("missing") for s in sides):
                     continue
-                pngs = {s: [sides[s]["frames"][(pos, t)] for t in times] for s in sides}
+                rt = run_times(pos, times, a.click_at)
+                pngs = {s: [sides[s]["frames"][(pos, t)] for t in rt] for s in sides}
                 if INJECT == "ref-control" and pos == positions[0]:
                     w, h, ch, px = png_decode(pngs["ref2"][0])
                     px = bytearray(px)
@@ -664,7 +715,7 @@ def main_run(a, out, target):
                     lm = sides[s]["states"][pos]["geo"]["landmarks"]
                     marks[s] = [(q, v["box"]) for q, v in lm.items() if v["visible"] >= LANDMARKS[q][1]]
                 tag = f"{vp}-{scheme}-{pos.strip('#').replace(' + ', '-').replace(' ', '_').replace('.', '')}"
-                jobs.append((vp, scheme, pos, times, pngs, marks, out, tag))
+                jobs.append((vp, scheme, pos, rt, pngs, marks, out, tag))
             print(f"{vp} {scheme}: {len(positions)} positions x {len(times)} times rendered on 3 sides, {time.time() - t0:.0f}s",
                   file=sys.stderr, flush=True)
 
@@ -695,9 +746,11 @@ def main_run(a, out, target):
         ok = not ctl[0] and not frm[0]
         table.append(f"| {vp} {vw}x{vh} | {scheme} | {pos} | {frame_ms(t)} | {h} | {ctl[0]:,} | {w_total[vp] - frm[0]:,} | {frm[0]:,} | {'equal' if ok else 'DIFFERS'} |")
     summary = {
-        "bytes": f"{loads_seen['reference']} reference loads and {loads_seen['target']} target loads"
+        "bytes": (f"target file on disk sha256 {sha256_bytes(open(target, 'rb').read())}; " if not is_url(target) else "")
+                 + f"{loads_seen['reference']} reference loads and {loads_seen['target']} target loads"
                  + (f"; target: {target_info.get('final_url')}, HTTP {target_info.get('status')}, Content-Type {target_info.get('content_type')!r}, "
                     f"body sha256 {target_info.get('raw_sha') or target_info.get('text_sha')}" if target_info else ""),
+        "navigation": "every load's main frame keeps the checked document through its last capture (one document response, one commit, same loader)",
         "sections": f"{len(expected)} expected: {', '.join(expected)}" if expected else "not asserted (--expect-sections '')",
         "scroll": "each position's scrollY and section/viewport intersection, after the scroll and after the last frame",
         "captures": f"{3 * len(rows)} captures decoded; size and non-uniformity checked",
@@ -716,7 +769,8 @@ def main_run(a, out, target):
     report = [f"reference: {ref_url}", f"target:    {tgt_url}",
               f"browser:   {version}, --deterministic-mode, virtual time, one beginFrame per 16.7 ms tick, scrollbars hidden, device scale 1",
               "t = virtual ms since the first frame after load (top) or after the scroll; the frame nearest the asked time"
-              + (f"; the click run clicks #site-theme right after the {frame_ms(a.click_at)} ms frame" if a.click_at >= 0 else ""),
+              + (f"; the click run clicks #site-theme right after the {frame_ms(a.click_at)} ms frame and also captures "
+                 f"{frame_ms(a.click_at + POST_CLICK)} ms" if a.click_at >= 0 else ""),
               "", *lines, "", "## Loads and theme", *("    " + n for n in notes), "", "## Frames", *table, "", f"Overall: {verdict}"]
     text = "\n".join(report)
     open(os.path.join(out, "report.md"), "w").write(text + "\n")
@@ -728,14 +782,22 @@ def main_run(a, out, target):
 # ---------------------------------------------------------------- --self-test
 
 class SplitHandler(http.server.BaseHTTPRequestHandler):
-    """Serves the reference to most clients, and a copy with an invisible comment to Chrome."""
+    """/: the reference to most clients, a copy with an invisible comment to Chrome.
+    /refresh: the exact reference, with a Refresh header that later navigates to /landed: the altered copy."""
     good = bad = b""
 
     def do_GET(self):
-        body = self.bad if "Chrome" in (self.headers.get("User-Agent") or "") else self.good
+        if self.path == "/refresh":
+            body = self.good
+        elif self.path == "/landed":
+            body = self.bad
+        else:
+            body = self.bad if "Chrome" in (self.headers.get("User-Agent") or "") else self.good
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if self.path == "/refresh":
+            self.send_header("Refresh", "1; url=/landed")
         self.end_headers()
         self.wfile.write(body)
 
@@ -753,16 +815,23 @@ def self_test(a, out):
         raise CouldNotRun("reference has no </body> to put the one-pixel overlay before")
     open(os.path.join(one_px, "index.html"), "wb").write(ref.replace(
         marker, b'<div style="position:fixed;left:0;top:0;width:1px;height:1px;background:#f0f;z-index:99999"></div>' + marker, 1))
+    bom = os.path.join(work, "bom.html")
+    open(bom, "wb").write(b"\xef\xbb\xbf" + ref)
     SplitHandler.good, SplitHandler.bad = ref, ref.replace(marker, b"<!-- not the owner's bytes -->" + marker, 1)
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SplitHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     split_url = f"http://127.0.0.1:{srv.server_address[1]}/"
     small = ["--viewports", "desktop", "--schemes", "light", "--times", "0,250,500", "--positions", "top,#architecture",
              "--click-at", "250", "--expect-sections", a.expect_sections, "--chrome", a.chrome]
-    cases = [  # name, target args, injected fault, expected exit, a line the report must contain
+    cases = [  # name, target and extra args, injected fault, expected exit, a line the report must contain
         ("clean: reference vs itself", [a.reference], "", 0, "Overall: PASS"),
+        ("clean, short custom times ending before the click", [a.reference, "--times", "0,250", "--positions", "top",
+                                                              "--click-at", "1000"], "", 0, "Overall: PASS"),
         ("reference control mismatch (one pixel of one reference frame)", [a.reference], "ref-control", 1, "FAIL control"),
         ("Chrome gets other bytes than other clients", [split_url], "", 1, "FAIL bytes"),
+        ("exact bytes, then a Refresh to an altered document after load", [split_url + "refresh", "--expect-content-type",
+         "text/html; charset=utf-8", "--times", "0,250,500,1500", "--positions", "top"], "", 1, "FAIL navigation"),
+        ("local file: a UTF-8 BOM before the exact bytes", [bom], "", 1, "FAIL bytes"),
         ("scroll does nothing", [a.reference], "no-scroll", 1, "FAIL scroll"),
         ("captures are blank", [a.reference], "blank-frames", 1, "FAIL captures"),
         ("captures are reused across times", [a.reference], "reused-frames", 1, "FAIL motion"),
@@ -772,7 +841,8 @@ def self_test(a, out):
     for i, (name, target, fault, want_rc, want_line) in enumerate(cases):
         t0 = time.time()
         env = dict(os.environ, VERIFY_PAGE_INJECT=fault)
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), a.reference, *target, *small,
+        args = [*target[:1], *small, *target[1:]] if not target[0].startswith("--") else [*small, *target]
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), a.reference, *args,
                             "--out", os.path.join(work, f"case{i}")], capture_output=True, text=True, env=env)
         caught = r.returncode == want_rc and want_line in r.stdout
         out_lines = r.stdout.splitlines()
