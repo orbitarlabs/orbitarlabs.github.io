@@ -1,0 +1,14 @@
+#!/bin/sh
+# Copy the benchmark cards and results of one orbitaR commit into data/, and record which commit.
+# The site shows no number that is not in these files. Usage: scripts/sync-data <orbitaR commit sha>
+set -eu
+sha=${1:?usage: scripts/sync-data <orbitaR commit sha>}
+case "$sha" in *[!0-9a-f]*) echo "sync-data: a hex commit sha"; exit 2;; esac
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+curl -fsSL "https://codeload.github.com/orbitarlabs/orbitaR/tar.gz/$sha" | tar -xz -C "$tmp" --strip-components 1
+rm -rf data && mkdir -p data
+cp "$tmp/benchmarks/RESULTS.toml" data/
+[ -d "$tmp/assets/benchmarks" ] && cp "$tmp"/assets/benchmarks/*.svg data/ 2>/dev/null || true
+full=$(curl -fsSL -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/orbitarlabs/orbitaR/commits/$sha")
+printf 'orbitarlabs/orbitaR %s\n' "$full" > data/SOURCE
+echo "sync-data: data/ now holds orbitaR $full"
