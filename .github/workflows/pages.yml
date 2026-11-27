@@ -24,6 +24,12 @@ jobs:
             done
           done
           exit $status
+      - name: index.html is the file PROVENANCE names, byte for byte
+        run: |
+          want=$(sed -nE 's/^index\.html = [^ ]+ sha256 ([0-9a-f]{64})$/\1/p' PROVENANCE)
+          test -n "$want" || { echo "PROVENANCE: no line 'index.html = <file> sha256 <64 hex>'"; exit 1; }
+          got=$(sha256sum index.html | cut -d' ' -f1)
+          [ "$got" = "$want" ] || { echo "index.html sha256 $got, PROVENANCE says $want"; exit 1; }
       - name: The data comes from one named orbitaR commit
         run: test ! -e data/RESULTS.toml || grep -qE '^orbitarlabs/orbitaR [0-9a-f]{40}$' data/SOURCE
   deploy:
